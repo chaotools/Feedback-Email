@@ -5,10 +5,14 @@ import os
 import smtplib
 import json
 import sys
+from collections import defaultdict, deque
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.utils import formatdate
+from html import escape
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from threading import Lock
+from time import monotonic
 from urllib.parse import urlparse
 
 # ====== CONFIG (from environment) ======
@@ -19,6 +23,16 @@ SMTP_PASS = os.getenv('SMTP_PASS', '')
 TO_EMAIL = os.getenv('TO_EMAIL', SMTP_USER)
 
 PORT = int(os.getenv('PORT', '8999'))
+ALLOWED_ORIGINS = frozenset(
+    origin.strip() for origin in os.getenv('ALLOWED_ORIGINS', 'https://chaotools.tech').split(',')
+    if origin.strip()
+)
+TRUST_PROXY = os.getenv('TRUST_PROXY', '').lower() in {'1', 'true', 'yes'}
+RATE_LIMIT_MAX = max(1, int(os.getenv('RATE_LIMIT_MAX', '10')))
+RATE_LIMIT_WINDOW = max(1, int(os.getenv('RATE_LIMIT_WINDOW', '3600')))
+
+request_times = defaultdict(deque)
+rate_limit_lock = Lock()
 
 
 class FeedbackHandler(BaseHTTPRequestHandler):
@@ -27,11 +41,43 @@ class FeedbackHandler(BaseHTTPRequestHandler):
             print(f"[{self.log_date_time_string()}] {args[0]}")
 
     def do_OPTIONS(self):
-        self.send_response(200)
-        self.send_header('Access-Control-Allow-Origin', '*')
+        if not self.is_allowed_origin():
+            self.send_json(403, {'error': 'Origin not allowed'})
+            return
+        self.send_response(204)
+        self.send_cors_headers()
         self.send_header('Access-Control-Allow-Methods', 'POST, OPTIONS')
         self.send_header('Access-Control-Allow-Headers', 'Content-Type')
         self.end_headers()
+
+    def client_ip(self):
+        # 仅在受信任反代会覆盖该请求头时使用，否则客户端可伪造来源 IP。
+        if TRUST_PROXY:
+            forwarded = self.headers.get('X-Forwarded-For', '')
+            if forwarded:
+                return forwarded.split(',', 1)[0].strip()
+        return self.client_address[0]
+
+    def is_allowed_origin(self):
+        return self.headers.get('Origin') in ALLOWED_ORIGINS
+
+    def send_cors_headers(self):
+        origin = self.headers.get('Origin')
+        if origin in ALLOWED_ORIGINS:
+            self.send_header('Access-Control-Allow-Origin', origin)
+            self.send_header('Vary', 'Origin')
+
+    def is_rate_limited(self):
+        now = monotonic()
+        client = self.client_ip()
+        with rate_limit_lock:
+            attempts = request_times[client]
+            while attempts and attempts[0] <= now - RATE_LIMIT_WINDOW:
+                attempts.popleft()
+            if len(attempts) >= RATE_LIMIT_MAX:
+                return True
+            attempts.append(now)
+        return False
 
     def do_POST(self):
         parsed_path = urlparse(self.path)
@@ -40,8 +86,20 @@ class FeedbackHandler(BaseHTTPRequestHandler):
             self.send_json(404, {'error': 'Not found'})
             return
 
-        length = int(self.headers.get('Content-Length', 0))
-        if length > 10000:
+        if not self.is_allowed_origin():
+            self.send_json(403, {'error': 'Origin not allowed'})
+            return
+
+        if self.is_rate_limited():
+            self.send_json(429, {'error': 'Too many requests. Please try again later.'})
+            return
+
+        try:
+            length = int(self.headers.get('Content-Length', 0))
+        except ValueError:
+            self.send_json(400, {'error': 'Invalid Content-Length'})
+            return
+        if length < 0 or length > 10000:
             self.send_json(413, {'error': 'Request too large'})
             return
 
@@ -57,7 +115,7 @@ class FeedbackHandler(BaseHTTPRequestHandler):
         fb_type = data.get('type', 'other').strip()
         message = (data.get('message') or data.get('msg') or '').strip()
 
-        if not name or len(name) < 1 or len(name) > 20:
+        if not name or len(name) < 1 or len(name) > 20 or '\r' in name or '\n' in name:
             self.send_json(400, {'error': 'Invalid name'})
             return
         if not message or len(message) < 5 or len(message) > 2000:
@@ -82,13 +140,16 @@ class FeedbackHandler(BaseHTTPRequestHandler):
     def send_json(self, code, data):
         self.send_response(code)
         self.send_header('Content-Type', 'application/json; charset=utf-8')
-        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_cors_headers()
         self.end_headers()
         self.wfile.write(json.dumps(data, ensure_ascii=False).encode('utf-8'))
 
 
 def send_email(name, email, fb_type, type_name, message):
     subject = f"[chaotools反馈] {type_name} - from {name}"
+    safe_name = escape(name)
+    safe_email = escape(email) if email else '<span style="color:#aaa">未填写</span>'
+    safe_message = escape(message)
 
     text_body = f"""你收到一条来自 chaotools.tech 的反馈：
 
@@ -113,15 +174,15 @@ def send_email(name, email, fb_type, type_name, message):
 
 <div style="background:#fff;padding:28px 24px;border-radius:0 0 14px 14px;border:1px solid #eee;border-top:none;">
 <table style="width:100%;font-size:14px;line-height:2;">
-<tr><td style="color:#888;width:80px;padding:4px 0;border-bottom:1px solid #f0f0f0;"><b>称呼</b></td><td style="border-bottom:1px solid #f0f0f0;">{name}</td></tr>
-<tr><td style="color:#888;padding:4px 0;border-bottom:1px solid #f0f0f0;"><b>邮箱</b></td><td style="border-bottom:1px solid #f0f0f0;">{email or '<span style="color:#aaa">未填写</span>'}</td></tr>
+<tr><td style="color:#888;width:80px;padding:4px 0;border-bottom:1px solid #f0f0f0;"><b>称呼</b></td><td style="border-bottom:1px solid #f0f0f0;">{safe_name}</td></tr>
+<tr><td style="color:#888;padding:4px 0;border-bottom:1px solid #f0f0f0;"><b>邮箱</b></td><td style="border-bottom:1px solid #f0f0f0;">{safe_email}</td></tr>
 <tr><td style="color:#888;padding:4px 0;border-bottom:1px solid #f0f0f0;"><b>类型</b></td><td style="border-bottom:1px solid #f0f0f0;">{type_name}</td></tr>
 <tr><td style="color:#888;padding:4px 0;border-bottom:1px solid #f0f0f0;"><b>时间</b></td><td style="border-bottom:1px solid #f0f0f0;">{formatdate(localtime=True)}</td></tr>
 </table>
 
 <div style="margin-top:20px;padding:16px;background:#f9fafb;border-radius:10px;border-left:3px solid #00ff9d;">
 <p style="color:#888;font-size:12px;margin-bottom:8px;"><b>详细内容</b></p>
-<pre style="white-space:pre-wrap;font-size:14px;line-height:1.7;margin:0;color:#333;">{message}</pre>
+<pre style="white-space:pre-wrap;font-size:14px;line-height:1.7;margin:0;color:#333;">{safe_message}</pre>
 </div>
 </div>
 

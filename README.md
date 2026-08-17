@@ -24,6 +24,11 @@ export SMTP_PORT="465"
 export SMTP_USER="your_email@163.com"
 export SMTP_PASS="your_password"
 export TO_EMAIL="your_email@163.com"
+# 只允许站点前端访问；多个域名用英文逗号分隔
+export ALLOWED_ORIGINS="https://chaotools.tech"
+# 每个来源 IP 在限流窗口内的最大提交次数（默认 10 次/小时）
+export RATE_LIMIT_MAX="10"
+export RATE_LIMIT_WINDOW="3600"
 ```
 
 ### 3. 运行
@@ -62,8 +67,11 @@ python3 feedback_api.py --test
 location /api/feedback {
     proxy_pass http://127.0.0.1:8999;
     proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $remote_addr;
 }
 ```
+
+使用反向代理时，请额外设置 `TRUST_PROXY=1`，以便按真实访客 IP 限流。反向代理必须覆盖而非透传客户端提供的 `X-Forwarded-For` 请求头。
 
 ## License
 
